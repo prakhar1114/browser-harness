@@ -467,6 +467,65 @@ def http_get(url, headers=None, timeout=20.0):
         return data.decode()
 
 
+_GEMINI_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".webp": "image/webp", ".gif": "image/gif"}
+
+def ask_gemini(prompt, schema, images=None, model="gemini-3-flash-preview",
+               thinking="low", timeout=30.0):
+    """Ask Gemini 3 Flash a structured-output decision question.
+    For END-TO-END SCRIPTS ONLY — not for interactive exploration.
+
+    Use when a finalized automation script needs a small judgment call that's
+    hard to express as code (e.g. pick the row that matches "1L Amul milk"
+    from a parsed list, or null). The model is forced to return JSON
+    conforming to `schema`, parsed and returned as a Python dict/list — so
+    downstream code can branch deterministically.
+
+        schema = {"type":"object",
+                  "properties":{"id":{"type":["string","null"]},
+                                "reason":{"type":"string"}},
+                  "required":["id","reason"]}
+        pick = ask_gemini(f"Pick best match for '1L Amul milk' or null.\\n{rows}", schema)
+        if pick["id"] is None: continue
+        else: add_to_cart(pick["id"])
+
+    images: list of file paths (jpg/png/webp/gif), sent inline as base64.
+    thinking: "minimal"|"low"|"medium"|"high". Default "low" for cheap calls.
+    """
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("ask_gemini: GEMINI_API_KEY not set in env (.env)")
+    parts = [{"text": prompt}]
+    for img in images or []:
+        ext = Path(img).suffix.lower()
+        mime = _GEMINI_MIME.get(ext)
+        if not mime:
+            raise RuntimeError(f"ask_gemini: unsupported image extension {ext!r} for {img}")
+        with open(img, "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+        parts.append({"inline_data": {"mime_type": mime, "data": data}})
+    body = {"contents": [{"parts": parts}],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": thinking},
+                                 "responseMimeType": "application/json",
+                                 "responseSchema": schema}}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"ask_gemini: HTTP {e.code}: {e.read().decode(errors='replace')}") from e
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"ask_gemini: unexpected response shape: {json.dumps(data)[:500]}") from e
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"ask_gemini: response not valid JSON: {text[:500]}") from e
+
+
 def _load_agent_helpers():
     p = AGENT_WORKSPACE / "agent_helpers.py"
     if not p.exists():

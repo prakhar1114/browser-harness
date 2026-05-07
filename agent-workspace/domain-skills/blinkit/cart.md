@@ -248,6 +248,45 @@ This applies across the whole site, not just the cart: search, order
 history, and order detail pages should all be visited in the same tab
 when navigating between them.
 
+## Programmatic add-to-cart (cart_fsm.py)
+
+`cart_fsm.py` next to this file packages the search → AI-pick → add flow
+as one function. It is **not** auto-loaded — exec the file inside a
+`browser-harness -c` block when you actually need it:
+
+```bash
+browser-harness -c '
+exec(open("agent-workspace/domain-skills/blinkit/cart_fsm.py").read())
+result = add_groceries("tomato, potato, amul masti 1L")
+import json; print(json.dumps(result, indent=2))
+'
+```
+
+`add_groceries(items_csv)` requires `GEMINI_API_KEY` in env and assumes
+Blinkit is logged in with a delivery address set.
+
+Return shape:
+
+```python
+{
+  "status": "success" | "failed",
+  "progress": [
+    {"item": "tomato", "status": "done",    "state": "DONE",   "chosen_id": "366032"},
+    {"item": "potato", "status": "skipped", "state": "DECIDE", "reason": "no good match"},
+    {"item": "x",      "status": "failed",  "state": "VERIFY", "error": "stepper did not appear"},
+    {"item": "y",      "status": "pending", "state": "SEARCH"},   # un-reached after a failure
+  ],
+  "error": "x failed at VERIFY: stepper did not appear",  # only when status=failed
+}
+```
+
+`status: "success"` iff every item ended `done` or `skipped`. On the first
+`failed` item the loop aborts and remaining items stay `pending` — a
+follow-up agent can re-invoke `add_groceries` with just the un-done items
+(everything not `done`/`skipped`) to continue. FSM states the entry can
+be parked at: `SEARCH`, `WAIT_RESULTS`, `PARSE`, `DECIDE`, `LOCATE`,
+`CLICK`, `VERIFY`, `DONE`.
+
 ## Not covered
 
 Checkout (`Proceed To Pay`), tip selection, donation toggle, address
