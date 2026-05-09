@@ -16,6 +16,12 @@ If a login modal pops up after Book Now, the script prints a prompt and
 blocks on `input()` until the user logs in (in the browser) and presses
 Enter on the passenger page.
 
+Session invariants (see search-form.md): IRCTC stores auth in per-tab
+sessionStorage, so the FSM (a) never opens a new tab — caller must open
+IRCTC and log in manually first, (b) pins to the IRCTC tab whose body
+shows "Welcome <name>", and (c) skips `goto_url` to /train-search when
+already on that route, since a full reload there drops the login.
+
 Returns:
     {"status": "success"|"failed",
      "state": <FSM state>, "error"?: str, "details": {...}}
@@ -475,19 +481,54 @@ def book_ticket(input_csv):
     state = _S_SEARCH
     try:
         state = _S_SEARCH
-        # Reuse an existing IRCTC tab if one is open (so the user's logged-in
-        # session is preserved). Only fall back to new_tab when none exists —
-        # opening fresh tabs has cost the script the login state in past runs.
+        # IRCTC binds login to a single tab (sessionStorage-based). Never open
+        # a new tab and never switch between IRCTC tabs mid-flow — both drop
+        # the login. Find the one IRCTC tab with an active session and pin
+        # everything to it.
         url = "https://www.irctc.co.in/nget/train-search"
         irctc_tabs = [t for t in (list_tabs() or [])
                       if "irctc.co.in" in (t.get("url") or "")]
-        if irctc_tabs:
-            switch_tab(irctc_tabs[0]["targetId"])
+        if not irctc_tabs:
+            return {"status": "failed", "state": state,
+                    "error": "No IRCTC tab open. Open https://www.irctc.co.in/nget/train-search "
+                             "and log in manually before running this script.",
+                    "details": details}
+
+        logged_in_tab = None
+        for t in irctc_tabs:
+            switch_tab(t["targetId"])
+            _time.sleep(0.3)
+            li = js("return !!(document.body && /Welcome\\s+\\S/.test(document.body.innerText) "
+                    "&& !/LOGIN\\/SIGN UP/i.test(document.body.innerText))")
+            if li:
+                logged_in_tab = t
+                break
+        if not logged_in_tab:
+            return {"status": "failed", "state": state,
+                    "error": "Found IRCTC tab(s) but none are logged in. Log in in the browser "
+                             "(do not open extra tabs — IRCTC drops session across tabs) and retry.",
+                    "details": {**details, "irctc_tabs": [t["url"] for t in irctc_tabs]}}
+
+        # IRCTC drops login on full reloads (Page.navigate). Only navigate if
+        # we are not already on /train-search; in that case fill the existing
+        # form in place. Reset From/To inputs so stale values from a previous
+        # run don't bleed in.
+        cur_url = (page_info() or {}).get("url", "")
+        if "/nget/train-search" not in cur_url:
             goto_url(url)
+            wait_for_load()
+            _time.sleep(1.0)
+            still_in = js("return !!(document.body && /Welcome\\s+\\S/.test(document.body.innerText) "
+                          "&& !/LOGIN\\/SIGN UP/i.test(document.body.innerText))")
+            if not still_in:
+                return {"status": "failed", "state": state,
+                        "error": "Logged out after navigating to /train-search. "
+                                 "Log in again in the same tab and retry.",
+                        "details": details}
         else:
-            new_tab(url)
-        wait_for_load()
-        _time.sleep(1.0)
+            # Clear any stale From/To text so the autocomplete starts fresh.
+            js("(()=>{['origin','destination'].forEach(id=>{const i=document.querySelector('p-autocomplete#'+id+' input');if(i){i.focus();i.value='';i.dispatchEvent(new Event('input',{bubbles:true}));}});})()")
+            _time.sleep(0.2)
 
         _autocomplete_pick("origin", cfg["from"], cfg["from_kind"])
         _time.sleep(0.4)

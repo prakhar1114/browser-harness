@@ -123,6 +123,10 @@ document.querySelector('.ui-confirmdialog button.ui-confirmdialog-acceptbutton')
   next. Press Escape after typing.
 - **`#loginModal` is gone.** Use `input[placeholder="User Name"]` for the
   visible login modal instead.
+- **Don't `goto_url` back to `/train-search` to retry.** A full reload
+  to the search route drops the IRCTC session (see search-form.md).
+  Recover via SPA navigation (in-page TRAINS link / browser Back) or
+  have the user re-login in the same tab.
 - **Reactive-form pristine flag.** Setting `.value =` on the age/name
   inputs without firing real key events leaves the form `ng-pristine`,
   which rejects Continue. Always use `type_text` (which dispatches keys

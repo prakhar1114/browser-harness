@@ -20,6 +20,31 @@ After submit, the page navigates to:
 https://www.irctc.co.in/nget/booking/train-list
 ```
 
+## Session is per-tab — do not open new tabs or reload the search route
+
+IRCTC keeps auth in `sessionStorage` (`PIM-SESSION-ID`,
+`nget-spa.*`), which is per-tab. Two consequences:
+
+- **Opening a second tab logs you out.** `new_tab(...)` and `switch_tab`
+  to a different IRCTC tab both produce a tab with no session, even
+  though cookies are shared. Find the tab the user logged in on and
+  pin every step of the flow to it.
+- **Reloading `/nget/train-search` drops the session.** A
+  `Page.navigate` (i.e. `goto_url(...)`) to that exact route while
+  already on it resets the Angular app to logged-out. Detect with
+  `page_info().url` and skip the navigate; reset the From/To inputs in
+  place instead.
+- Same-tab SPA navigations (form submit → train-list → Book Now →
+  psgninput) go through Angular's router, not a full reload, so they
+  preserve session.
+
+Detect login state from the body text:
+
+```js
+/Welcome\s+\S/.test(document.body.innerText)
+  && !/LOGIN\/SIGN UP/i.test(document.body.innerText)
+```
+
 ## Field map
 
 | Field   | Wrapper                        | Inner input (aria-label)                                         | Widget       |
@@ -225,9 +250,27 @@ MTWTFSS` then dep/arr rows.
 
 ## End-to-end (deterministic, no LLM, no coordinate clicks)
 
+User must open IRCTC and log in manually first — the script never
+opens a tab of its own (see "Session is per-tab" above).
+
 ```python
 import time
-new_tab("https://www.irctc.co.in/nget/train-search"); wait_for_load()
+# Pin to the tab where the user is logged in. Never new_tab; never
+# goto_url to /train-search if we're already there.
+irctc_tabs = [t for t in (list_tabs() or [])
+              if "irctc.co.in" in (t.get("url") or "")]
+assert irctc_tabs, "Open IRCTC and log in before running this script."
+for t in irctc_tabs:
+    switch_tab(t["targetId"])
+    if js("return /Welcome\\s+\\S/.test(document.body.innerText) "
+          "&& !/LOGIN\\/SIGN UP/i.test(document.body.innerText)"):
+        break
+else:
+    raise RuntimeError("No logged-in IRCTC tab found.")
+
+if "/nget/train-search" not in (page_info() or {}).get("url", ""):
+    goto_url("https://www.irctc.co.in/nget/train-search")
+    wait_for_load()
 
 # From — type code, pick by code-anchored regex
 js("document.querySelector('p-autocomplete#origin input').focus()")
@@ -258,6 +301,11 @@ wait_for_load()
 
 ## Quirks & traps
 
+- **Single-tab session.** `sessionStorage`-based auth → `new_tab` and
+  switching to a different IRCTC tab both lose the login. Reuse the
+  tab where the user logged in.
+- **Reload of `/nget/train-search` drops session.** If already on that
+  route, skip `goto_url`; reset form inputs in place via JS.
 - **PrimeNG, not vanilla.** No `<select>`, no `value=`. Every widget
   opens + click-on-list-item.
 - **`js()` scope persists across calls.** `const`/`let` declarations

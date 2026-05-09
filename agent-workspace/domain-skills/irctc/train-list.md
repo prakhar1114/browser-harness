@@ -42,3 +42,4 @@ if (!btn.classList.contains('disable-book')) {
 - **`div.pre-avl` reuse**: It's used for both the top-level class boxes and the inner date cells. Always use text filtering (`(CODE)` vs `Day, DD Mon`) or precise scoping (`td.link` parent) to distinguish them.
 - **Date click**: Clicking `<td>` does nothing. Click the inner `div.pre-avl`.
 - **Login Modal**: If logged out, Book Now opens a login modal instead of navigating. Don't automate login credentials, ask the user.
+- **Don't `goto_url` away from this page.** Full reloads can drop the IRCTC session (auth is in per-tab `sessionStorage`; see search-form.md). Class/date/Book Now interactions are SPA-internal and safe — stay inside the SPA until `/booking/psgninput`.
