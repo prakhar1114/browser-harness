@@ -83,6 +83,78 @@ sel.dispatchEvent(new Event('change', {bubbles: true}));
 All native `<select>` with sensible defaults (India / No Preference /
 default catering). Skip unless the user explicitly asked.
 
+## Adding more passengers (max 6)
+
+A single `app-passenger` row is rendered on initial page load. To book
+for multiple travellers, click the **+ Add Passenger** anchor once per
+extra row, then fill the new row with the same selectors as the first
+(scoped to the last `app-passenger`). The cap is **6 passengers per
+booking**; click 7 is a no-op and IRCTC shows the toast
+"Maximum number of Passengers, You cannot select more."
+
+The anchor has no stable id or class — the entire row of action
+links sits inside `app-passenger-input` and the visible text is the
+only durable handle:
+
+| Action                       | Element | Visible text                    | Adds                                   |
+| ---------------------------- | ------- | ------------------------------- | -------------------------------------- |
+| Add Passenger                | `<a>`   | `+ Add Passenger`               | another `app-passenger` (counts to 6)  |
+| Add Infant With Berth        | `<a>`   | `/ Add Infant With Berth`       | another `app-passenger` (counts to 6)  |
+| Add Infant Without Berth     | `<a>`   | `+ Add Infant Without Berth`    | new `app-infant` row (separate cap)    |
+
+The first two share an outer `<a>` whose text is
+`+ Add Passenger/ Add Infant With Berth`; each `span.prenext` inside
+is its own click target. "Infant with berth" is an adult passenger
+slot under the hood — it adds an `app-passenger`, not an `app-infant`.
+
+Click pattern:
+
+```js
+(() => {
+  const a = Array.from(document.querySelectorAll('app-passenger-input a'))
+    .find(el => /^\+\s*Add Passenger\b/i.test((el.innerText||'').trim())
+                 && el.offsetParent !== null);
+  if (a) a.click();
+})()
+```
+
+Then fill the newly appended row by indexing into the `app-passenger`
+NodeList. The Name/Age/Gender selectors are the same as the first row
+— just scope them with `document.querySelectorAll('app-passenger')[i]`
+instead of `document.querySelector('app-passenger')`.
+
+End-to-end fill loop (sketch — uses helpers from `booking_fsm.py`):
+
+```python
+for i, p in enumerate(passengers):
+    if i > 0:
+        js("(()=>{const a=Array.from(document.querySelectorAll('app-passenger-input a'))"
+           ".find(el=>/^\\+\\s*Add Passenger\\b/i.test((el.innerText||'').trim())"
+           " && el.offsetParent!==null);if(a)a.click();})()")
+        time.sleep(0.4)
+    # fill last row — replace `document.querySelector('app-passenger')` with
+    # `document.querySelectorAll('app-passenger')[i]` in the name/age/gender JS.
+```
+
+Stop at 6: probe `document.querySelectorAll('app-passenger').length` and
+break (or surface the toast) if a click fails to grow the count.
+
+## Infant without berth (`app-infant`)
+
+Different element, different field set. Lap-children only (≤ 4 years),
+not a passenger slot.
+
+```
+app-infant
+  input[formcontrolname="name", placeholder="Name", type="text"]
+  select[formcontrolname="age"]    ← "Below one year" (0), 1, 2, 3, 4
+  select[formcontrolname="gender"] ← M / F
+```
+
+Age is a `<select>`, not a free `<input type=number>` — so set
+`sel.value` and dispatch `change` (same trick as gender on the adult
+row). No nationality / berth-pref / food-pref selects render here.
+
 ## Login modal detection
 
 The login modal is a `p-dialog` that overlays `/booking/psgninput` when

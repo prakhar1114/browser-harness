@@ -12,6 +12,12 @@ come from harness globals via exec — this file does not import them.
 Input CSV: from, to, date, passenger_name, sex, age, train, class
 All 8 fields required. Quota always GENERAL.
 
+Multiple passengers: pipe-separate the name/sex/age fields. The three
+lists must be equal length, max 6 (IRCTC General-quota cap). Example —
+two passengers in one call:
+
+    "BPL, NDLS, 2026-07-01, Prakhar Jain|Anshul Jain, M|M, 28|30, 12001, CC"
+
 If a login modal pops up after Book Now, the script prints a prompt and
 blocks on `input()` until the user logs in (in the browser) and presses
 Enter on the passenger page.
@@ -93,20 +99,36 @@ def _parse_input(s):
     if d is None:
         raise ValueError(f"date {date_s!r}: use YYYY-MM-DD or DD/MM/YYYY")
 
-    # Sex
-    sx = sex.strip().lower()
+    # Passengers — name/sex/age may be pipe-separated for multiple riders.
+    # The three lists must be equal length and ≤ 6 (IRCTC General-quota cap).
     sex_map = {"m": "M", "male": "M", "f": "F", "female": "F",
                "t": "T", "trans": "T", "transgender": "T"}
-    if sx not in sex_map:
-        raise ValueError(f"sex {sex!r}: expected M/F/T (or male/female/trans)")
-
-    # Age
-    try:
-        age = int(age_s)
-    except ValueError:
-        raise ValueError(f"age {age_s!r}: not an integer")
-    if age < 1 or age > 125:
-        raise ValueError(f"age {age!r}: out of range")
+    names = [p.strip() for p in name.split("|")]
+    sexes_raw = [p.strip() for p in sex.split("|")]
+    ages_raw = [p.strip() for p in age_s.split("|")]
+    if not (len(names) == len(sexes_raw) == len(ages_raw)):
+        raise ValueError(
+            f"passenger lists must be equal length: "
+            f"names={len(names)} sexes={len(sexes_raw)} ages={len(ages_raw)}"
+        )
+    if len(names) > 6:
+        raise ValueError(f"too many passengers ({len(names)}): IRCTC caps at 6")
+    passengers = []
+    for i, (nm, sx_raw, ag_raw) in enumerate(zip(names, sexes_raw, ages_raw)):
+        if not nm:
+            raise ValueError(f"passenger #{i+1}: empty name")
+        sx = sx_raw.lower()
+        if sx not in sex_map:
+            raise ValueError(
+                f"passenger #{i+1} sex {sx_raw!r}: expected M/F/T (or male/female/trans)"
+            )
+        try:
+            ag = int(ag_raw)
+        except ValueError:
+            raise ValueError(f"passenger #{i+1} age {ag_raw!r}: not an integer")
+        if ag < 1 or ag > 125:
+            raise ValueError(f"passenger #{i+1} age {ag!r}: out of range")
+        passengers.append({"name": nm, "sex": sex_map[sx], "age": ag})
 
     # Class
     klass_u = klass.strip().upper()
@@ -133,9 +155,7 @@ def _parse_input(s):
         "from": frm_code, "from_kind": frm_kind,
         "to": to_code, "to_kind": to_kind,
         "date": d,
-        "name": name,
-        "sex": sex_map[sx],
-        "age": age,
+        "passengers": passengers,
         "train": train,
         "class": klass_u,
     }
@@ -400,57 +420,60 @@ def _post_booknow_outcome(timeout=20.0):
     return "timeout"
 
 
-def _fill_passenger_form(name, sex, age):
-    """Fill the first passenger row on /booking/psgninput.
+def _add_passenger_row():
+    """Click the `+ Add Passenger` anchor on /booking/psgninput.
 
-    Selectors verified live 2026-05-08 (see passenger-form.md):
-
-    - Name: `p-autocomplete[formcontrolname="passengerName"] input`
-      (placeholder="Name", maxlength=16). Free-form text accepted.
-    - Age:  `input[formcontrolname="passengerAge"]` (type=number, max=125).
-    - Gender: native `select[formcontrolname="passengerGender"]` with
-      values M/F/T — set value + dispatch change so Angular's reactive
-      form picks it up.
+    The anchor has no stable id/class — match by visible text, scoped to
+    `app-passenger-input`. Returns True if a new `app-passenger` rendered,
+    False if the click was a no-op (likely the 6-passenger cap).
+    See passenger-form.md > "Adding more passengers".
     """
-    deadline = _time.time() + 15
+    before = js("return document.querySelectorAll('app-passenger').length")
+    js(r"""(() => {
+  const a = Array.from(document.querySelectorAll('app-passenger-input a'))
+    .find(el => /^\+\s*Add Passenger\b/i.test((el.innerText||'').trim())
+                 && el.offsetParent !== null);
+  if (a) a.click();
+})()""")
+    deadline = _time.time() + 3
     while _time.time() < deadline:
-        ok = js("return !!document.querySelector('app-passenger')")
-        if ok:
-            break
-        _time.sleep(0.3)
-    else:
-        raise RuntimeError("passenger form never rendered")
+        n = js("return document.querySelectorAll('app-passenger').length")
+        if n > before:
+            return True
+        _time.sleep(0.2)
+    return False
 
-    # Name — focus the inner input of the passengerName autocomplete, type.
+
+def _fill_passenger_row(idx, name, sex, age):
+    """Fill app-passenger[idx]. Selectors per passenger-form.md."""
     js(r"""
-const row = document.querySelector('app-passenger');
+const rows = document.querySelectorAll('app-passenger');
+const row = rows[__IDX__];
+if (!row) return false;
 const inp = row.querySelector('p-autocomplete[formcontrolname="passengerName"] input');
 inp.scrollIntoView({block: 'center'});
 inp.focus(); inp.value = '';
-return null;
-""")
+return true;
+""".replace("__IDX__", str(idx)))
     _time.sleep(0.2)
     type_text(name[:16])  # respect maxlength
     _time.sleep(0.4)
-    # Dismiss any autocomplete suggestion panel.
     press_key("Escape")
     _time.sleep(0.2)
 
-    # Age — focus and type. type_text fires real keys so Angular validators see them.
     js(r"""
-const row = document.querySelector('app-passenger');
+const row = document.querySelectorAll('app-passenger')[__IDX__];
 const inp = row.querySelector('input[formcontrolname="passengerAge"]');
 inp.scrollIntoView({block: 'center'});
 inp.focus(); inp.value = '';
 return null;
-""")
+""".replace("__IDX__", str(idx)))
     _time.sleep(0.2)
     type_text(str(age))
     _time.sleep(0.2)
 
-    # Gender — native <select>; set value and dispatch change for Angular.
     ok = js(r"""
-const row = document.querySelector('app-passenger');
+const row = document.querySelectorAll('app-passenger')[__IDX__];
 const sel = row.querySelector('select[formcontrolname="passengerGender"]');
 if (!sel) return false;
 sel.scrollIntoView({block: 'center'});
@@ -458,9 +481,33 @@ sel.value = __VAL__;
 sel.dispatchEvent(new Event('input',  {bubbles: true}));
 sel.dispatchEvent(new Event('change', {bubbles: true}));
 return sel.value === __VAL__;
-""".replace("__VAL__", _json.dumps(sex)))
+""".replace("__IDX__", str(idx)).replace("__VAL__", _json.dumps(sex)))
     if not ok:
-        raise RuntimeError(f"gender select rejected value {sex!r}")
+        raise RuntimeError(f"row {idx}: gender select rejected value {sex!r}")
+
+
+def _fill_passenger_form(passengers):
+    """Fill all passenger rows on /booking/psgninput.
+
+    `passengers` is a list of {name, sex, age} dicts (1–6 entries). Adds
+    rows via `+ Add Passenger` as needed; raises if IRCTC caps the click.
+    """
+    deadline = _time.time() + 15
+    while _time.time() < deadline:
+        if js("return !!document.querySelector('app-passenger')"):
+            break
+        _time.sleep(0.3)
+    else:
+        raise RuntimeError("passenger form never rendered")
+
+    for i, p in enumerate(passengers):
+        if i > 0:
+            if not _add_passenger_row():
+                raise RuntimeError(
+                    f"+ Add Passenger click did not append row {i+1} "
+                    f"(IRCTC caps at 6 per booking)"
+                )
+        _fill_passenger_row(i, p["name"], p["sex"], p["age"])
 
 
 def book_ticket(input_csv):
@@ -613,7 +660,7 @@ def book_ticket(input_csv):
                     "details": details}
 
         state = _S_PSGN
-        _fill_passenger_form(cfg["name"], cfg["sex"], cfg["age"])
+        _fill_passenger_form(cfg["passengers"])
 
         return {"status": "success", "state": "PASSENGER_FORM_FILLED",
                 "details": details}
