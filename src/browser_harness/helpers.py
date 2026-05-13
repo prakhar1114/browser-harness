@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, sys, time, urllib.request
+import base64, importlib.util, json, math, os, subprocess, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -470,8 +470,54 @@ def http_get(url, headers=None, timeout=20.0):
 _GEMINI_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                 ".webp": "image/webp", ".gif": "image/gif"}
 
+_ASK_USER_TOOL = {"functionDeclarations": [{
+    "name": "ask_user",
+    "description": "Ask the human a short clarifying question when the prompt is ambiguous or missing info needed to produce the requested schema. Only call this when guessing would likely be wrong.",
+    "parameters": {"type": "object",
+                   "properties": {"question": {"type": "string"}},
+                   "required": ["question"]}}]}
+
+
+def _ask_user_dialog(question, timeout=300):
+    """Block on a native macOS dialog; return the user's text. macOS only."""
+    # ensure_ascii=False: AppleScript only understands \" \\ \n \r \t escapes,
+    # so json.dumps's default \uXXXX (e.g. for ₹) breaks osascript with a
+    # syntax error. Pass the raw unicode through — AppleScript handles it.
+    script = (f'display dialog {json.dumps(question, ensure_ascii=False)} '
+              f'default answer "" with title "browser-harness" '
+              f'buttons {{"Cancel","OK"}} default button "OK"')
+    r = subprocess.run(["osascript", "-e", script],
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f"_ask_user_dialog: osascript failed: {r.stderr.strip()}")
+    for part in r.stdout.split(", "):
+        if part.startswith("text returned:"):
+            return part.split(":", 1)[1].rstrip("\n")
+    raise RuntimeError(f"_ask_user_dialog: unexpected osascript output: {r.stdout!r}")
+
+
+def _gemini_request(contents, schema, tools, model, thinking, timeout):
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("ask_gemini: GEMINI_API_KEY not set in env (.env)")
+    body = {"contents": contents,
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": thinking},
+                                 "responseMimeType": "application/json",
+                                 "responseSchema": schema}}
+    if tools:
+        body["tools"] = tools
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"ask_gemini: HTTP {e.code}: {e.read().decode(errors='replace')}") from e
+
+
 def ask_gemini(prompt, schema, images=None, model="gemini-3-flash-preview",
-               thinking="low", timeout=30.0):
+               thinking="low", timeout=30.0, allow_user=False, max_rounds=4):
     """Ask Gemini 3 Flash a structured-output decision question.
     For END-TO-END SCRIPTS ONLY — not for interactive exploration.
 
@@ -491,10 +537,13 @@ def ask_gemini(prompt, schema, images=None, model="gemini-3-flash-preview",
 
     images: list of file paths (jpg/png/webp/gif), sent inline as base64.
     thinking: "minimal"|"low"|"medium"|"high". Default "low" for cheap calls.
+
+    If allow_user=True (default), Gemini may ask the user a clarifying
+    question via a native macOS dialog. The user's answer is fed back to
+    Gemini, which produces the final schema-conformant response. The script
+    never sees raw user input. Requires macOS. Set allow_user=False for
+    unattended runs (or on non-macOS).
     """
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("ask_gemini: GEMINI_API_KEY not set in env (.env)")
     parts = [{"text": prompt}]
     for img in images or []:
         ext = Path(img).suffix.lower()
@@ -504,26 +553,31 @@ def ask_gemini(prompt, schema, images=None, model="gemini-3-flash-preview",
         with open(img, "rb") as f:
             data = base64.b64encode(f.read()).decode()
         parts.append({"inline_data": {"mime_type": mime, "data": data}})
-    body = {"contents": [{"parts": parts}],
-            "generationConfig": {"thinkingConfig": {"thinkingLevel": thinking},
-                                 "responseMimeType": "application/json",
-                                 "responseSchema": schema}}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"x-goog-api-key": key, "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"ask_gemini: HTTP {e.code}: {e.read().decode(errors='replace')}") from e
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(f"ask_gemini: unexpected response shape: {json.dumps(data)[:500]}") from e
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"ask_gemini: response not valid JSON: {text[:500]}") from e
+    contents = [{"role": "user", "parts": parts}]
+    tools = [_ASK_USER_TOOL] if allow_user else None
+
+    for _ in range(max_rounds):
+        resp = _gemini_request(contents, schema, tools, model, thinking, timeout)
+        try:
+            cand_parts = resp["candidates"][0]["content"]["parts"]
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"ask_gemini: unexpected response shape: {json.dumps(resp)[:500]}") from e
+        fc = next((p["functionCall"] for p in cand_parts if "functionCall" in p), None)
+        if fc and fc.get("name") == "ask_user":
+            question = (fc.get("args") or {}).get("question", "")
+            answer = _ask_user_dialog(question)
+            contents.append({"role": "model", "parts": cand_parts})
+            contents.append({"role": "user", "parts": [{"functionResponse": {
+                "name": "ask_user", "response": {"answer": answer}}}]})
+            continue
+        text = next((p["text"] for p in cand_parts if "text" in p), None)
+        if text is None:
+            raise RuntimeError(f"ask_gemini: no text in response: {json.dumps(resp)[:500]}")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"ask_gemini: response not valid JSON: {text[:500]}") from e
+    raise RuntimeError(f"ask_gemini: exceeded max_rounds={max_rounds} clarification rounds")
 
 
 def _load_agent_helpers():

@@ -6,11 +6,21 @@
     print(result)
     '
 
-Core helpers (js, cdp, type_text, new_tab, goto_url, wait_for_load, page_info)
-come from harness globals via exec — this file does not import them.
+Core helpers (js, cdp, type_text, press_key, new_tab, goto_url, wait_for_load,
+page_info, list_tabs, switch_tab, ask_gemini) come from harness globals via
+exec — this file does not import them.
 
 Input CSV: from, to, date, passenger_name, sex, age, train, class
-All 8 fields required. Quota always GENERAL.
+All 8 comma-separated fields required, but `train` and/or `class` may be
+left empty — when missing, after the train list renders the FSM calls
+`ask_gemini` (with `allow_user=True`), which pops a native macOS dialog
+listing the available options and uses the user's reply to continue.
+Requires macOS (osascript) and `GEMINI_API_KEY` in env. Quota always
+GENERAL.
+
+    "BPL, NDLS, 2026-05-25, Anshul Jain, M, 30, , 3A"   # ask for train
+    "BPL, NDLS, 2026-05-25, Anshul Jain, M, 30, 12951, " # ask for class
+    "BPL, NDLS, 2026-05-25, Anshul Jain, M, 30, , "      # ask for both
 
 Multiple passengers: pipe-separate the name/sex/age fields. The three
 lists must be equal length, max 6 (IRCTC General-quota cap). Example —
@@ -82,8 +92,7 @@ def _parse_input(s):
         )
     frm, to, date_s, name, sex, age_s, train, klass = parts
     for label, val in [("from", frm), ("to", to), ("date", date_s),
-                       ("passenger_name", name), ("sex", sex), ("age", age_s),
-                       ("train", train), ("class", klass)]:
+                       ("passenger_name", name), ("sex", sex), ("age", age_s)]:
         if not val:
             raise ValueError(f"empty field: {label}")
 
@@ -130,9 +139,9 @@ def _parse_input(s):
             raise ValueError(f"passenger #{i+1} age {ag!r}: out of range")
         passengers.append({"name": nm, "sex": sex_map[sx], "age": ag})
 
-    # Class
+    # Class — empty means "ask the user via ask_gemini after the train list renders".
     klass_u = klass.strip().upper()
-    if klass_u not in _VALID_CLASS_CODES:
+    if klass_u and klass_u not in _VALID_CLASS_CODES:
         raise ValueError(
             f"class {klass!r}: expected one of {sorted(_VALID_CLASS_CODES)}"
         )
@@ -274,6 +283,84 @@ def _match_train(cards, train_arg):
         return num_matches
     needle = train_arg.strip().lower()
     return [c for c in cards if needle in c["name"].lower()]
+
+
+def _pick_train_with_gemini(cards, cfg):
+    """Ask the user (via ask_gemini → native dialog) which train to book.
+
+    Returns the chosen train_number (string). Raises RuntimeError if the
+    model returns a number that isn't on any card.
+    """
+    options = [{"number": c["number"], "name": c["name"], "dep": c["dep"],
+                "arr": c["arr"], "duration": c["duration"], "runs_on": c["runs_on"],
+                "classes": c["classes"]}
+               for c in cards]
+    prompt = (
+        f"The user wants to book a ticket from {cfg['from']} to {cfg['to']} on "
+        f"{cfg['date'].isoformat()} but did NOT specify which train. "
+        "Below is the live list of trains parsed from IRCTC for this route+date. "
+        "You MUST call the ask_user tool to show the user a clear, numbered list "
+        "of these trains (each line: index, train number, name, dep->arr, duration, "
+        "and a short summary of class availability/fare) and ask which one to book. "
+        "Use PLAIN TEXT only — no markdown (no **, no *, no #, no backticks, no "
+        "tables). The dialog renders raw text. After receiving the user's reply "
+        "(their index, the train number, or the train name), return the matching "
+        "train_number exactly as it appears in the options. Do NOT pick on the "
+        "user's behalf without asking.\n\n"
+        f"Options (JSON):\n{_json.dumps(options, indent=2)}"
+    )
+    schema = {"type": "object",
+              "properties": {"train_number": {"type": "string"},
+                             "reason": {"type": "string"}},
+              "required": ["train_number", "reason"]}
+    pick = ask_gemini(prompt, schema, allow_user=False, thinking="low")
+    num = (pick.get("train_number") or "").strip()
+    if not any(c["number"] == num for c in cards):
+        raise RuntimeError(
+            f"gemini returned train_number {num!r} which is not on the train list"
+        )
+    return num, pick.get("reason", "")
+
+
+def _pick_class_with_gemini(chosen_card, cfg):
+    """Ask the user which class to book on the already-chosen train.
+
+    Returns the chosen class_code. Raises RuntimeError if the model returns
+    a code that isn't offered on this card or isn't a valid IRCTC class.
+    """
+    classes = chosen_card["classes"]
+    if not classes:
+        raise RuntimeError(
+            f"train {chosen_card['number']} has no class boxes on the card"
+        )
+    prompt = (
+        f"The user wants to book {chosen_card['number']} ({chosen_card['name']}) "
+        f"from {cfg['from']} to {cfg['to']} on {cfg['date'].isoformat()} but did "
+        "NOT specify which class. You MUST call the ask_user tool to show the "
+        "user the list of classes available on this train (each line: code, fare, "
+        "availability) and ask which one to book. Use PLAIN TEXT only — no "
+        "markdown (no **, no *, no #, no backticks, no tables). The dialog "
+        "renders raw text. After receiving the user's reply, return the matching "
+        "class_code exactly as it appears in the options. Do NOT pick on the "
+        "user's behalf without asking.\n\n"
+        f"Classes (JSON):\n{_json.dumps(classes, indent=2)}"
+    )
+    schema = {"type": "object",
+              "properties": {"class_code": {"type": "string"},
+                             "reason": {"type": "string"}},
+              "required": ["class_code", "reason"]}
+    pick = ask_gemini(prompt, schema, allow_user=False, thinking="low")
+    code = (pick.get("class_code") or "").strip().upper()
+    if code not in _VALID_CLASS_CODES:
+        raise RuntimeError(
+            f"gemini returned class_code {code!r} which is not a valid IRCTC class"
+        )
+    if not any(c["code"] == code for c in classes):
+        raise RuntimeError(
+            f"gemini returned class_code {code!r} which is not on train "
+            f"{chosen_card['number']} (offered: {[c['code'] for c in classes]})"
+        )
+    return code, pick.get("reason", "")
 
 
 def _click_class_box(card_index, class_code):
@@ -607,6 +694,10 @@ def book_ticket(input_csv):
         if not cards:
             return {"status": "failed", "state": state,
                     "error": "parser returned 0 cards", "details": details}
+        if not cfg["train"]:
+            picked_num, reason = _pick_train_with_gemini(cards, cfg)
+            cfg["train"] = picked_num
+            details["chosen_via_gemini"] = {"train_number": picked_num, "reason": reason}
         matches = _match_train(cards, cfg["train"])
         if len(matches) == 0:
             return {"status": "failed", "state": state,
@@ -625,6 +716,11 @@ def book_ticket(input_csv):
                                    "index": chosen["index"]}
 
         state = _S_PICK_CLASS
+        if not cfg["class"]:
+            picked_class, reason = _pick_class_with_gemini(chosen, cfg)
+            cfg["class"] = picked_class
+            details.setdefault("chosen_via_gemini", {})["class_code"] = picked_class
+            details["chosen_via_gemini"]["class_reason"] = reason
         res = _click_class_box(chosen["index"], cfg["class"])
         if not res.get("ok"):
             return {"status": "failed", "state": state,
