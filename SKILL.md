@@ -7,7 +7,7 @@ description: Direct browser control via CDP. Use when the user wants to automate
 
 Direct browser control via CDP. For task-specific edits, use `agent-workspace/agent_helpers.py`. For setup, install, or connection problems, read install.md.
 
-Domain skills (community-contributed per-site playbooks under `agent-workspace/domain-skills/`) are off by default. Set `BH_DOMAIN_SKILLS=1` to enable them; see the bottom section.
+Domain skills (community-contributed per-site playbooks under `agent-workspace/domain-skills/`).
 
 ## Usage
 
@@ -115,15 +115,25 @@ If you start struggling with a specific mechanic while navigating, look in inter
 
 ## Domain skills (opt-in)
 
-This section only applies when `BH_DOMAIN_SKILLS=1` is set. Otherwise ignore it — `agent-workspace/domain-skills/` is dormant and `goto_url` will not surface skill files.
+Do NOT preload all domain skills into context. They are per-site playbooks and most are irrelevant to any given task. The workflow is: **list → match → read only the one you need**.
 
-When enabled, search `agent-workspace/domain-skills/` first for the domain you are working on before inventing a new approach. `goto_url` also returns up to 10 skill filenames for the navigated host.
+1. List available domains for the site you're working on:
+   ```bash
+   ls agent-workspace/domain-skills/ | grep -i <site>
+   # or
+   rg --files agent-workspace/domain-skills/<site> 2>/dev/null
+   ```
+2. If a matching folder exists, read only the specific file(s) relevant to your task (e.g. `agent-workspace/domain-skills/amazon/search.md`), not the whole folder.
+3. If no match, proceed without one and consider contributing a new skill when you're done.
+
+`goto_url` also returns up to 10 skill filenames for the navigated host — use those as the shortlist to Read from, not as content to load wholesale.
 
 Useful commands:
 
 ```bash
-rg --files agent-workspace/domain-skills
-rg -n "tiktok|upload" agent-workspace/domain-skills
+ls agent-workspace/domain-skills/                         # full domain list
+rg --files agent-workspace/domain-skills/<site>           # files for one site
+rg -n "tiktok|upload" agent-workspace/domain-skills       # keyword search across all
 ```
 
 If you learned anything non-obvious about how a site works, open a PR to `agent-workspace/domain-skills/<site>/` before you finish. Default to contributing. The harness gets better only because agents file what they learn. If figuring something out cost you a few steps, the next run should not pay the same tax.

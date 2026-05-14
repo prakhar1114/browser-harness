@@ -158,8 +158,6 @@ def _has_return_statement(expression):
 # --- navigation / page ---
 def goto_url(url):
     r = cdp("Page.navigate", url=url)
-    if os.environ.get("BH_DOMAIN_SKILLS") != "1":
-        return r
     d = (AGENT_WORKSPACE / "domain-skills" / (urlparse(url).hostname or "").removeprefix("www.").split(".")[0])
     return {**r, "domain_skills": sorted(p.name for p in d.rglob("*.md"))[:10]} if d.is_dir() else r
 

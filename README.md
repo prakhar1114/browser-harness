@@ -61,10 +61,4 @@ PRs and improvements welcome. The best way to help: **contribute a new domain sk
 
 If you're not sure where to start, open an issue and we'll point you somewhere useful.
 
-## Domain skills
-
-Set `BH_DOMAIN_SKILLS=1` to enable [agent-workspace/domain-skills/](agent-workspace/domain-skills/) — community-contributed per-site playbooks `goto_url` surfaces by domain. Contribute via PR.
-
----
-
 [The Bitter Lesson of Agent Harnesses](https://browser-use.com/posts/bitter-lesson-agent-harnesses) · [Web Agents That Actually Learn](https://browser-use.com/posts/web-agents-that-actually-learn)
