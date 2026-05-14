@@ -123,8 +123,7 @@ Do NOT preload all domain skills into context. They are per-site playbooks and m
    # or
    rg --files agent-workspace/domain-skills/<site> 2>/dev/null
    ```
-2. If a matching folder exists, read only the specific file(s) relevant to your task (e.g. `agent-workspace/domain-skills/amazon/search.md`), not the whole folder.
-3. If no match, proceed without one and consider contributing a new skill when you're done.
+2. If no match, proceed without one and consider contributing a new skill when you're done.
 
 `goto_url` also returns up to 10 skill filenames for the navigated host — use those as the shortlist to Read from, not as content to load wholesale.
 
