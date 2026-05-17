@@ -77,6 +77,48 @@ def test_page_info_raises_clear_error_on_js_exception():
             helpers.page_info()
 
 
+# --- ask_gemini ---
+
+def test_ask_gemini_sends_no_tools_and_parses_json(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    schema = {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+    seen = {}
+
+    def fake_request(contents, request_schema, tools, model, thinking, timeout):
+        seen.update({
+            "contents": contents,
+            "schema": request_schema,
+            "tools": tools,
+            "model": model,
+            "thinking": thinking,
+            "timeout": timeout,
+        })
+        return {"candidates": [{"content": {"parts": [{"text": '{"id":"row-1"}'}]}}]}
+
+    with patch("browser_harness.helpers._gemini_request", side_effect=fake_request):
+        result = helpers.ask_gemini("Pick a row", schema, model="gemini-test", thinking="minimal", timeout=3.0)
+
+    assert result == {"id": "row-1"}
+    assert seen["tools"] is None
+    assert seen["schema"] == schema
+    assert seen["model"] == "gemini-test"
+    assert seen["thinking"] == "minimal"
+    assert seen["timeout"] == 3.0
+    assert seen["contents"] == [{"role": "user", "parts": [{"text": "Pick a row"}]}]
+
+
+def test_ask_gemini_rejects_function_call_only_response(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    schema = {"type": "object"}
+
+    def fake_request(contents, request_schema, tools, model, thinking, timeout):
+        return {"candidates": [{"content": {"parts": [{"functionCall": {"name": "unsupported_tool"}}]}}]}
+
+    with patch("browser_harness.helpers._gemini_request", side_effect=fake_request):
+        with pytest.raises(RuntimeError, match="ask_gemini: no text in response"):
+            helpers.ask_gemini("Pick a row", schema)
+
+
 # --- fill_input ---
 
 def test_fill_input_focuses_types_and_fires_events():
@@ -302,4 +344,3 @@ def test_wait_for_network_idle_returns_false_on_timeout():
         result = helpers.wait_for_network_idle(timeout=10.0, idle_ms=500)
 
     assert result is False
-
