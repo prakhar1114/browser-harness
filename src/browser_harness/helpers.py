@@ -158,6 +158,8 @@ def _has_return_statement(expression):
 # --- navigation / page ---
 def goto_url(url):
     r = cdp("Page.navigate", url=url)
+    if not os.environ.get("BH_DOMAIN_SKILLS"):
+        return r
     d = (AGENT_WORKSPACE / "domain-skills" / (urlparse(url).hostname or "").removeprefix("www.").split(".")[0])
     return {**r, "domain_skills": sorted(p.name for p in d.rglob("*.md"))[:10]} if d.is_dir() else r
 
@@ -465,75 +467,148 @@ def http_get(url, headers=None, timeout=20.0):
         return data.decode()
 
 
-_GEMINI_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                ".webp": "image/webp", ".gif": "image/gif"}
+_LLM_IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                   ".webp": "image/webp", ".gif": "image/gif"}
+_LLM_MODEL = "sonnet"
+_LLM_EFFORT = "medium"
+_LLM_API_KEY_ENV = "ANTHROPIC_API_KEY"
 
 
-def _gemini_request(contents, schema, tools, model, thinking, timeout):
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("ask_gemini: GEMINI_API_KEY not set in env (.env)")
-    body = {"contents": contents,
-            "generationConfig": {"thinkingConfig": {"thinkingLevel": thinking},
-                                 "responseMimeType": "application/json",
-                                 "responseSchema": schema}}
-    if tools:
-        body["tools"] = tools
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+def _llm_content_blocks(prompt, images):
+    parts = [{"type": "text", "text": prompt}]
+    for img in images or []:
+        ext = Path(img).suffix.lower()
+        mime = _LLM_IMAGE_MIME.get(ext)
+        if not mime:
+            raise RuntimeError(f"ask_llm: unsupported image extension {ext!r} for {img}")
+        with open(img, "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+        parts.append({"type": "image",
+                      "source": {"type": "base64", "media_type": mime, "data": data}})
+    return parts
+
+
+def _extract_json_from_llm_response(resp):
+    parsed = getattr(resp, "parsed_output", None)
+    if parsed is not None:
+        return parsed
+    texts = []
+    for block in getattr(resp, "content", []) or []:
+        block_parsed = getattr(block, "parsed_output", None)
+        if block_parsed is not None:
+            return block_parsed
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            texts.append(text)
+        elif isinstance(block, dict) and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+    text = "\n".join(t for t in texts if t).strip()
+    if not text:
+        raise RuntimeError(f"ask_llm: no text in LLM response: {str(resp)[:500]}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"ask_gemini: HTTP {e.code}: {e.read().decode(errors='replace')}") from e
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"ask_llm: response not valid JSON: {text[:500]}") from e
 
 
-def ask_gemini(prompt, schema, images=None, model="gemini-3-flash-preview",
-               thinking="low", timeout=30.0):
-    """Ask Gemini 3 Flash a structured-output decision question.
+def _llm_sdk_request(prompt, schema, images, timeout):
+    try:
+        import anthropic
+    except ImportError as e:
+        raise RuntimeError("ask_llm: LLM SDK package is not installed") from e
+    try:
+        client = anthropic.Anthropic(api_key=os.environ[_LLM_API_KEY_ENV])
+        resp = client.messages.create(
+            model=_LLM_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": _llm_content_blocks(prompt, images)}],
+            output_config={"format": {"type": "json_schema", "schema": schema},
+                           "effort": _LLM_EFFORT},
+            timeout=timeout,
+        )
+    except Exception as e:
+        raise RuntimeError(f"ask_llm: LLM SDK request failed: {e}") from e
+    return _extract_json_from_llm_response(resp)
+
+
+async def _agent_sdk_request_async(prompt, schema, images):
+    if images:
+        raise RuntimeError("ask_llm: images require ANTHROPIC_API_KEY; Claude Agent SDK fallback is text-only")
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+    except ImportError as e:
+        raise RuntimeError("ask_llm: claude-agent-sdk package is not installed") from e
+    options = ClaudeAgentOptions(
+        model=_LLM_MODEL,
+        allowed_tools=[],
+        tools=[],
+        cwd=str(REPO_ROOT),
+        effort=_LLM_EFFORT,
+        output_format={"type": "json_schema", "schema": schema},
+    )
+    async for message in query(prompt=prompt, options=options):
+        if isinstance(message, ResultMessage):
+            if getattr(message, "is_error", False):
+                err = getattr(message, "result", None) or getattr(message, "subtype", None) or "unknown error"
+                raise RuntimeError(f"ask_llm: Claude Agent SDK request failed: {err}")
+            structured = getattr(message, "structured_output", None)
+            if structured is not None:
+                return structured
+            result = getattr(message, "result", None)
+            if isinstance(result, str) and result.strip():
+                try:
+                    return json.loads(result)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"ask_llm: Agent SDK response not valid JSON: {result[:500]}") from e
+    raise RuntimeError("ask_llm: Claude Agent SDK response had no structured_output")
+
+
+def _run_agent_sdk_request(prompt, schema, images):
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_agent_sdk_request_async(prompt, schema, images))
+
+    # Browser-harness scripts are normally synchronous. If embedded inside an
+    # existing event loop, run the SDK's async query on a short-lived thread.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(
+            lambda: asyncio.run(_agent_sdk_request_async(prompt, schema, images))
+        ).result()
+
+
+def ask_llm(prompt, schema, images=None, model=None, thinking=None, timeout=30.0):
+    """Ask LLM a structured-output decision question.
     For END-TO-END SCRIPTS ONLY — not for interactive exploration.
 
     Use when a finalized automation script needs a small judgment call that's
     hard to express as code (e.g. pick the row that matches "1L Amul milk"
-    from a parsed list, or null). The model is forced to return JSON
-    conforming to `schema`, parsed and returned as a Python dict/list — so
-    downstream code can branch deterministically.
+    from a parsed list, or null). LLM is asked for JSON conforming to
+    `schema`, parsed and returned as a Python dict/list — so downstream code
+    can branch deterministically.
 
         schema = {"type":"object",
                   "properties":{"id":{"type":["string","null"]},
                                 "reason":{"type":"string"}},
                   "required":["id","reason"]}
-        pick = ask_gemini(f"Pick best match for '1L Amul milk' or null.\\n{rows}", schema)
+        pick = ask_llm(f"Pick best match for '1L Amul milk' or null.\\n{rows}", schema)
         if pick["id"] is None: continue
         else: add_to_cart(pick["id"])
 
     images: list of file paths (jpg/png/webp/gif), sent inline as base64.
-    thinking: "minimal"|"low"|"medium"|"high". Default "low" for cheap calls.
+    model/thinking are accepted for compatibility but this helper always uses
+    model "sonnet" with medium effort.
     """
-    parts = [{"text": prompt}]
-    for img in images or []:
-        ext = Path(img).suffix.lower()
-        mime = _GEMINI_MIME.get(ext)
-        if not mime:
-            raise RuntimeError(f"ask_gemini: unsupported image extension {ext!r} for {img}")
-        with open(img, "rb") as f:
-            data = base64.b64encode(f.read()).decode()
-        parts.append({"inline_data": {"mime_type": mime, "data": data}})
-    contents = [{"role": "user", "parts": parts}]
+    if os.environ.get(_LLM_API_KEY_ENV):
+        return _llm_sdk_request(prompt, schema, images, timeout)
+    return _run_agent_sdk_request(prompt, schema, images)
 
-    resp = _gemini_request(contents, schema, None, model, thinking, timeout)
-    try:
-        cand_parts = resp["candidates"][0]["content"]["parts"]
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(f"ask_gemini: unexpected response shape: {json.dumps(resp)[:500]}") from e
-    text = next((p["text"] for p in cand_parts if "text" in p), None)
-    if text is None:
-        raise RuntimeError(f"ask_gemini: no text in response: {json.dumps(resp)[:500]}")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"ask_gemini: response not valid JSON: {text[:500]}") from e
+
+def ask_gemini(prompt, schema, images=None, model="sonnet", thinking="low", timeout=30.0):
+    """Deprecated compatibility wrapper for ask_llm()."""
+    return ask_llm(prompt, schema, images=images, model=model, thinking=thinking, timeout=timeout)
 
 
 def _load_agent_helpers():

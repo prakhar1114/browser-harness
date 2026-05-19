@@ -1,6 +1,8 @@
 import os
+import sys
 import tempfile
 import time
+import types
 from unittest.mock import patch
 
 import pytest
@@ -77,46 +79,148 @@ def test_page_info_raises_clear_error_on_js_exception():
             helpers.page_info()
 
 
-# --- ask_gemini ---
+# --- ask_llm / ask_gemini ---
 
-def test_ask_gemini_sends_no_tools_and_parses_json(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+def test_ask_llm_uses_sdk_structured_output_and_parses_json(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     schema = {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
     seen = {}
 
-    def fake_request(contents, request_schema, tools, model, thinking, timeout):
+    class FakeMessages:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return types.SimpleNamespace(
+                content=[types.SimpleNamespace(type="text", text='{"id":"row-1"}')]
+            )
+
+    class FakeLLMClient:
+        def __init__(self, api_key):
+            seen["api_key"] = api_key
+            self.messages = FakeMessages()
+
+    fake_llm_sdk = types.SimpleNamespace(Anthropic=FakeLLMClient)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_llm_sdk)
+
+    result = helpers.ask_llm("Pick a row", schema, model="sonnet", thinking="minimal", timeout=3.0)
+
+    assert result == {"id": "row-1"}
+    assert seen["api_key"] == "test-key"
+    assert seen["model"] == "sonnet"
+    assert seen["output_config"] == {
+        "format": {"type": "json_schema", "schema": schema},
+        "effort": "medium",
+    }
+    assert seen["timeout"] == 3.0
+    assert seen["messages"] == [{"role": "user", "content": [{"type": "text", "text": "Pick a row"}]}]
+
+
+def test_ask_llm_encodes_images_for_sdk(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    schema = {"type": "object"}
+    seen = {}
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return types.SimpleNamespace(
+                content=[types.SimpleNamespace(type="text", text='{"ok":true}')]
+            )
+
+    class FakeLLMClient:
+        def __init__(self, api_key):
+            self.messages = FakeMessages()
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeLLMClient))
+    with tempfile.NamedTemporaryFile(suffix=".png") as f:
+        f.write(b"fake image")
+        f.flush()
+        assert helpers.ask_llm("Inspect", schema, images=[f.name]) == {"ok": True}
+
+    image_block = seen["messages"][0]["content"][1]
+    assert image_block["type"] == "image"
+    assert image_block["source"]["media_type"] == "image/png"
+    assert image_block["source"]["data"] == "ZmFrZSBpbWFnZQ=="
+
+
+def test_ask_llm_falls_back_to_agent_sdk_structured_output(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    schema = {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+    seen = {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.is_error = False
+            self.structured_output = {"id": "row-2"}
+
+    class FakeClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    async def fake_query(prompt, options):
+        seen["prompt"] = prompt
+        yield FakeResultMessage()
+
+    fake_sdk = types.SimpleNamespace(
+        ClaudeAgentOptions=FakeClaudeAgentOptions,
+        ResultMessage=FakeResultMessage,
+        query=fake_query,
+    )
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+
+    assert helpers.ask_llm("Pick a row", schema, model="sonnet", thinking="low") == {"id": "row-2"}
+    assert seen["prompt"] == "Pick a row"
+    assert seen["model"] == "sonnet"
+    assert seen["effort"] == "medium"
+    assert seen["tools"] == []
+    assert seen["allowed_tools"] == []
+    assert seen["output_format"] == {"type": "json_schema", "schema": schema}
+
+
+def test_ask_gemini_alias_delegates_to_ask_llm(monkeypatch):
+    seen = {}
+
+    def fake_ask_llm(prompt, schema, images=None, model="sonnet", thinking="low", timeout=30.0):
         seen.update({
-            "contents": contents,
-            "schema": request_schema,
-            "tools": tools,
+            "prompt": prompt,
+            "schema": schema,
+            "images": images,
             "model": model,
             "thinking": thinking,
             "timeout": timeout,
         })
-        return {"candidates": [{"content": {"parts": [{"text": '{"id":"row-1"}'}]}}]}
+        return {"id": "row-3"}
 
-    with patch("browser_harness.helpers._gemini_request", side_effect=fake_request):
-        result = helpers.ask_gemini("Pick a row", schema, model="gemini-test", thinking="minimal", timeout=3.0)
+    monkeypatch.setattr(helpers, "ask_llm", fake_ask_llm)
+    schema = {"type": "object"}
+    assert helpers.ask_gemini("Pick a row", schema, images=["x.png"], model="claude-test", timeout=5.0) == {"id": "row-3"}
+    assert seen == {
+        "prompt": "Pick a row",
+        "schema": schema,
+        "images": ["x.png"],
+        "model": "claude-test",
+        "thinking": "low",
+        "timeout": 5.0,
+    }
 
-    assert result == {"id": "row-1"}
-    assert seen["tools"] is None
-    assert seen["schema"] == schema
-    assert seen["model"] == "gemini-test"
-    assert seen["thinking"] == "minimal"
-    assert seen["timeout"] == 3.0
-    assert seen["contents"] == [{"role": "user", "parts": [{"text": "Pick a row"}]}]
 
-
-def test_ask_gemini_rejects_function_call_only_response(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+def test_ask_llm_rejects_text_only_malformed_json(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     schema = {"type": "object"}
 
-    def fake_request(contents, request_schema, tools, model, thinking, timeout):
-        return {"candidates": [{"content": {"parts": [{"functionCall": {"name": "unsupported_tool"}}]}}]}
+    class FakeMessages:
+        def create(self, **kwargs):
+            return types.SimpleNamespace(
+                content=[types.SimpleNamespace(type="text", text="not json")]
+            )
 
-    with patch("browser_harness.helpers._gemini_request", side_effect=fake_request):
-        with pytest.raises(RuntimeError, match="ask_gemini: no text in response"):
-            helpers.ask_gemini("Pick a row", schema)
+    class FakeLLMClient:
+        def __init__(self, api_key):
+            self.messages = FakeMessages()
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeLLMClient))
+
+    with pytest.raises(RuntimeError, match="ask_llm: response not valid JSON"):
+        helpers.ask_llm("Pick a row", schema)
 
 
 # --- fill_input ---
