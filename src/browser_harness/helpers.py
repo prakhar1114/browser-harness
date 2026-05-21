@@ -532,8 +532,6 @@ def _llm_sdk_request(prompt, schema, images, timeout):
 
 
 async def _agent_sdk_request_async(prompt, schema, images):
-    if images:
-        raise RuntimeError("ask_llm: images require ANTHROPIC_API_KEY; Claude Agent SDK fallback is text-only")
     try:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
     except ImportError as e:
@@ -546,7 +544,18 @@ async def _agent_sdk_request_async(prompt, schema, images):
         effort=_LLM_EFFORT,
         output_format={"type": "json_schema", "schema": schema},
     )
-    async for message in query(prompt=prompt, options=options):
+    if images:
+        # Single-message (string) input can't carry images. Stream a user
+        # message whose content is text + inline base64 image blocks instead.
+        content = _llm_content_blocks(prompt, images)
+
+        async def _prompt_stream():
+            yield {"type": "user", "message": {"role": "user", "content": content}}
+
+        prompt_arg = _prompt_stream()
+    else:
+        prompt_arg = prompt
+    async for message in query(prompt=prompt_arg, options=options):
         if isinstance(message, ResultMessage):
             if getattr(message, "is_error", False):
                 err = getattr(message, "result", None) or getattr(message, "subtype", None) or "unknown error"
