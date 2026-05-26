@@ -543,6 +543,7 @@ async def _agent_sdk_request_async(prompt, schema, images):
         cwd=str(REPO_ROOT),
         effort=_LLM_EFFORT,
         output_format={"type": "json_schema", "schema": schema},
+        max_buffer_size=20 * 1024 * 1024,
     )
     if images:
         # Single-message (string) input can't carry images. Stream a user
