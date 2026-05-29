@@ -6,7 +6,7 @@
     print(result)
     '
 
-Core helpers (js, cdp, ask_gemini, new_tab, goto_url, wait_for_load) come from
+Core helpers (js, cdp, ask_llm, new_tab, goto_url, wait_for_load) come from
 the harness globals via exec — this file does not import them.
 
 Returns a progress dict: {"status": "success"|"failed", "progress": [...], "error": str?}.
@@ -117,7 +117,7 @@ def _slow_click(x, y, jitter=5, steps=3):
     cdp("Input.dispatchMouseEvent", type="mouseReleased", x=tx, y=ty, button="left", clickCount=1)
 
 
-def _gemini_pick(item, candidates):
+def _llm_pick(item, candidates):
     schema = {
         "type": "object",
         "properties": {
@@ -135,7 +135,7 @@ def _gemini_pick(item, candidates):
         "Return the candidate's `id` field exactly as given.\n\n"
         f"Candidates (JSON):\n{_json.dumps(candidates, indent=2)}"
     )
-    res = ask_gemini(prompt, schema)
+    res = ask_llm(prompt, schema)
     chosen = (res.get("chosen_id") or "").strip()
     if chosen.lower() in ("", "none", "null"):
         return None, res.get("reason", "")
@@ -224,7 +224,7 @@ def add_groceries(items_csv):
             # DECIDE
             entry["state"] = _S_DECIDE
             try:
-                chosen_id, reason = _gemini_pick(item, candidates)
+                chosen_id, reason = _llm_pick(item, candidates)
             except Exception as e:
                 fail(entry, _S_DECIDE, f"gemini error: {e}")
                 first_error = first_error or f"{item} failed at {_S_DECIDE}: {entry['error']}"

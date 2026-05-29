@@ -7,14 +7,14 @@
     '
 
 Core helpers (js, cdp, type_text, press_key, new_tab, goto_url, wait_for_load,
-page_info, list_tabs, switch_tab, ask_gemini) come from harness globals via
+page_info, list_tabs, switch_tab, ask_llm) come from harness globals via
 exec — this file does not import them.
 
 Input CSV: from, to, date, passenger_name, sex, age, train, class
 All 8 comma-separated fields required, but `train` and/or `class` may be
 left empty — when missing, after the train list renders the FSM calls
-`ask_gemini` to make a schema-constrained selection from the live options.
-Requires `GEMINI_API_KEY` in env. Quota always GENERAL.
+`ask_llm` to make a schema-constrained selection from the live options.
+Quota always GENERAL.
 
     "BPL, NDLS, 2026-05-25, Anshul Jain, M, 30, , 3A"   # infer train
     "BPL, NDLS, 2026-05-25, Anshul Jain, M, 30, 12951, " # infer class
@@ -137,7 +137,7 @@ def _parse_input(s):
             raise ValueError(f"passenger #{i+1} age {ag!r}: out of range")
         passengers.append({"name": nm, "sex": sex_map[sx], "age": ag})
 
-    # Class — empty means ask_gemini will choose from the rendered train list.
+    # Class — empty means ask_llm will choose from the rendered train list.
     klass_u = klass.strip().upper()
     if klass_u and klass_u not in _VALID_CLASS_CODES:
         raise ValueError(
@@ -283,8 +283,8 @@ def _match_train(cards, train_arg):
     return [c for c in cards if needle in c["name"].lower()]
 
 
-def _pick_train_with_gemini(cards, cfg):
-    """Use ask_gemini to choose which train to book from the live options.
+def _pick_train_with_llm(cards, cfg):
+    """Use ask_llm to choose which train to book from the live options.
 
     Returns the chosen train_number (string). Raises RuntimeError if the
     model returns a number that isn't on any card.
@@ -308,17 +308,17 @@ def _pick_train_with_gemini(cards, cfg):
               "properties": {"train_number": {"type": "string"},
                              "reason": {"type": "string"}},
               "required": ["train_number", "reason"]}
-    pick = ask_gemini(prompt, schema, thinking="low")
+    pick = ask_llm(prompt, schema)
     num = (pick.get("train_number") or "").strip()
     if not any(c["number"] == num for c in cards):
         raise RuntimeError(
-            f"gemini returned train_number {num!r} which is not on the train list"
+            f"ask_llm returned train_number {num!r} which is not on the train list"
         )
     return num, pick.get("reason", "")
 
 
-def _pick_class_with_gemini(chosen_card, cfg):
-    """Use ask_gemini to choose a class on the already-chosen train.
+def _pick_class_with_llm(chosen_card, cfg):
+    """Use ask_llm to choose a class on the already-chosen train.
 
     Returns the chosen class_code. Raises RuntimeError if the model returns
     a code that isn't offered on this card or isn't a valid IRCTC class.
@@ -342,15 +342,15 @@ def _pick_class_with_gemini(chosen_card, cfg):
               "properties": {"class_code": {"type": "string"},
                              "reason": {"type": "string"}},
               "required": ["class_code", "reason"]}
-    pick = ask_gemini(prompt, schema, thinking="low")
+    pick = ask_llm(prompt, schema)
     code = (pick.get("class_code") or "").strip().upper()
     if code not in _VALID_CLASS_CODES:
         raise RuntimeError(
-            f"gemini returned class_code {code!r} which is not a valid IRCTC class"
+            f"ask_llm returned class_code {code!r} which is not a valid IRCTC class"
         )
     if not any(c["code"] == code for c in classes):
         raise RuntimeError(
-            f"gemini returned class_code {code!r} which is not on train "
+            f"ask_llm returned class_code {code!r} which is not on train "
             f"{chosen_card['number']} (offered: {[c['code'] for c in classes]})"
         )
     return code, pick.get("reason", "")
@@ -688,9 +688,9 @@ def book_ticket(input_csv):
             return {"status": "failed", "state": state,
                     "error": "parser returned 0 cards", "details": details}
         if not cfg["train"]:
-            picked_num, reason = _pick_train_with_gemini(cards, cfg)
+            picked_num, reason = _pick_train_with_llm(cards, cfg)
             cfg["train"] = picked_num
-            details["chosen_via_gemini"] = {"train_number": picked_num, "reason": reason}
+            details["chosen_via_llm"] = {"train_number": picked_num, "reason": reason}
         matches = _match_train(cards, cfg["train"])
         if len(matches) == 0:
             return {"status": "failed", "state": state,
@@ -710,10 +710,10 @@ def book_ticket(input_csv):
 
         state = _S_PICK_CLASS
         if not cfg["class"]:
-            picked_class, reason = _pick_class_with_gemini(chosen, cfg)
+            picked_class, reason = _pick_class_with_llm(chosen, cfg)
             cfg["class"] = picked_class
-            details.setdefault("chosen_via_gemini", {})["class_code"] = picked_class
-            details["chosen_via_gemini"]["class_reason"] = reason
+            details.setdefault("chosen_via_llm", {})["class_code"] = picked_class
+            details["chosen_via_llm"]["class_reason"] = reason
         res = _click_class_box(chosen["index"], cfg["class"])
         if not res.get("ok"):
             return {"status": "failed", "state": state,

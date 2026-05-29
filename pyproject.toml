@@ -8,10 +8,9 @@ version = "0.1.0"
 description = "The simplest, thinnest, and most powerful harness to control your real browser with your agent."
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.101.0",
     "cdp-use==1.4.5",
-    "claude-agent-sdk==0.2.82",
     "fetch-use==0.4.0",
+    "llm-resolver",
     "pillow==12.2.0",
     "websockets==15.0.1",
 ]
@@ -27,3 +26,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.uv.sources]
+llm-resolver = { path = "../../packages/llm-resolver", editable = true }

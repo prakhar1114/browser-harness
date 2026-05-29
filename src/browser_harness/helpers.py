@@ -7,6 +7,8 @@ import base64, importlib.util, json, math, os, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from llm_resolver import ask_llm as _ask_llm
+
 from . import _ipc as ipc
 
 
@@ -467,129 +469,7 @@ def http_get(url, headers=None, timeout=20.0):
         return data.decode()
 
 
-_LLM_IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                   ".webp": "image/webp", ".gif": "image/gif"}
-_LLM_MODEL = "sonnet"
-_LLM_EFFORT = "medium"
-_LLM_API_KEY_ENV = "ANTHROPIC_API_KEY"
-
-
-def _llm_content_blocks(prompt, images):
-    parts = [{"type": "text", "text": prompt}]
-    for img in images or []:
-        ext = Path(img).suffix.lower()
-        mime = _LLM_IMAGE_MIME.get(ext)
-        if not mime:
-            raise RuntimeError(f"ask_llm: unsupported image extension {ext!r} for {img}")
-        with open(img, "rb") as f:
-            data = base64.b64encode(f.read()).decode()
-        parts.append({"type": "image",
-                      "source": {"type": "base64", "media_type": mime, "data": data}})
-    return parts
-
-
-def _extract_json_from_llm_response(resp):
-    parsed = getattr(resp, "parsed_output", None)
-    if parsed is not None:
-        return parsed
-    texts = []
-    for block in getattr(resp, "content", []) or []:
-        block_parsed = getattr(block, "parsed_output", None)
-        if block_parsed is not None:
-            return block_parsed
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            texts.append(text)
-        elif isinstance(block, dict) and isinstance(block.get("text"), str):
-            texts.append(block["text"])
-    text = "\n".join(t for t in texts if t).strip()
-    if not text:
-        raise RuntimeError(f"ask_llm: no text in LLM response: {str(resp)[:500]}")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"ask_llm: response not valid JSON: {text[:500]}") from e
-
-
-def _llm_sdk_request(prompt, schema, images, timeout):
-    try:
-        import anthropic
-    except ImportError as e:
-        raise RuntimeError("ask_llm: LLM SDK package is not installed") from e
-    try:
-        client = anthropic.Anthropic(api_key=os.environ[_LLM_API_KEY_ENV])
-        resp = client.messages.create(
-            model=_LLM_MODEL,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": _llm_content_blocks(prompt, images)}],
-            output_config={"format": {"type": "json_schema", "schema": schema},
-                           "effort": _LLM_EFFORT},
-            timeout=timeout,
-        )
-    except Exception as e:
-        raise RuntimeError(f"ask_llm: LLM SDK request failed: {e}") from e
-    return _extract_json_from_llm_response(resp)
-
-
-async def _agent_sdk_request_async(prompt, schema, images):
-    try:
-        from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-    except ImportError as e:
-        raise RuntimeError("ask_llm: claude-agent-sdk package is not installed") from e
-    options = ClaudeAgentOptions(
-        model=_LLM_MODEL,
-        allowed_tools=[],
-        tools=[],
-        cwd=str(REPO_ROOT),
-        effort=_LLM_EFFORT,
-        output_format={"type": "json_schema", "schema": schema},
-        max_buffer_size=20 * 1024 * 1024,
-    )
-    if images:
-        # Single-message (string) input can't carry images. Stream a user
-        # message whose content is text + inline base64 image blocks instead.
-        content = _llm_content_blocks(prompt, images)
-
-        async def _prompt_stream():
-            yield {"type": "user", "message": {"role": "user", "content": content}}
-
-        prompt_arg = _prompt_stream()
-    else:
-        prompt_arg = prompt
-    async for message in query(prompt=prompt_arg, options=options):
-        if isinstance(message, ResultMessage):
-            if getattr(message, "is_error", False):
-                err = getattr(message, "result", None) or getattr(message, "subtype", None) or "unknown error"
-                raise RuntimeError(f"ask_llm: Claude Agent SDK request failed: {err}")
-            structured = getattr(message, "structured_output", None)
-            if structured is not None:
-                return structured
-            result = getattr(message, "result", None)
-            if isinstance(result, str) and result.strip():
-                try:
-                    return json.loads(result)
-                except json.JSONDecodeError as e:
-                    raise RuntimeError(f"ask_llm: Agent SDK response not valid JSON: {result[:500]}") from e
-    raise RuntimeError("ask_llm: Claude Agent SDK response had no structured_output")
-
-
-def _run_agent_sdk_request(prompt, schema, images):
-    import asyncio
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(_agent_sdk_request_async(prompt, schema, images))
-
-    # Browser-harness scripts are normally synchronous. If embedded inside an
-    # existing event loop, run the SDK's async query on a short-lived thread.
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(
-            lambda: asyncio.run(_agent_sdk_request_async(prompt, schema, images))
-        ).result()
-
-
-def ask_llm(prompt, schema, images=None, model=None, thinking=None, timeout=30.0):
+def ask_llm(prompt, schema, images=None):
     """Ask LLM a structured-output decision question.
     For END-TO-END SCRIPTS ONLY — not for interactive exploration.
 
@@ -607,18 +487,9 @@ def ask_llm(prompt, schema, images=None, model=None, thinking=None, timeout=30.0
         if pick["id"] is None: continue
         else: add_to_cart(pick["id"])
 
-    images: list of file paths (jpg/png/webp/gif), sent inline as base64.
-    model/thinking are accepted for compatibility but this helper always uses
-    model "sonnet" with medium effort.
+    images: optional list of local image paths (jpg/png/webp/gif).
     """
-    if os.environ.get(_LLM_API_KEY_ENV):
-        return _llm_sdk_request(prompt, schema, images, timeout)
-    return _run_agent_sdk_request(prompt, schema, images)
-
-
-def ask_gemini(prompt, schema, images=None, model="sonnet", thinking="low", timeout=30.0):
-    """Deprecated compatibility wrapper for ask_llm()."""
-    return ask_llm(prompt, schema, images=images, model=model, thinking=thinking, timeout=timeout)
+    return _ask_llm(prompt, schema, images=images)
 
 
 def _load_agent_helpers():
