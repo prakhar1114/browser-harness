@@ -28,4 +28,4 @@ where = ["src"]
 pythonpath = ["src"]
 
 [tool.uv.sources]
-llm-resolver = { path = "../../packages/llm-resolver", editable = true }
+llm-resolver = { path = "../../packages/llm-resolver" }
